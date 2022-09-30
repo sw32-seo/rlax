@@ -37,7 +37,6 @@ def build_network(num_hidden_units: int, num_actions: int) -> hk.Transformed:
         flatten = lambda x: jnp.reshape(x, (-1,))
         network = hk.Sequential([
             flatten,
-            # nets.MLP([num_hidden_units, num_hidden_units]), jax.nn.relu,
             nets.MLP([num_hidden_units, num_actions + 1])
         ])
         return network(obs)
