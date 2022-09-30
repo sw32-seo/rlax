@@ -27,19 +27,19 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import rlax
-from rlax.examples import experiment
+import experiment
 
-ActorOutput = collections.namedtuple("ActorOutput", ["actions", "logits"])
+ActorOutput = collections.namedtuple("ActorOutput", ["actions", "logits", "q_values"])
 
 FLAGS = flags.FLAGS
 flags.DEFINE_integer("seed", 42, "Random seed.")
-flags.DEFINE_integer("train_episodes", 500, "Number of train episodes.")
+flags.DEFINE_integer("train_episodes", 10000, "Number of train episodes.")
 flags.DEFINE_integer("num_hidden_units", 50, "Number of network hidden units.")
-flags.DEFINE_integer("sequence_length", 4, "Length of (action, timestep) sequences.")
+flags.DEFINE_integer("sequence_length", 500, "Length of (action, timestep) sequences.")
 flags.DEFINE_float("epsilon", 0.01, "Epsilon-greedy exploration probability.")
 flags.DEFINE_float("lambda_", 0.9, "Mixing parameter for Q(lambda).")
 flags.DEFINE_float("discount_factor", 0.99, "Q-learning discount factor.")
-flags.DEFINE_float("learning_rate", 0.005, "Optimizer learning rate.")
+flags.DEFINE_float("learning_rate", 0.001, "Optimizer learning rate.")
 flags.DEFINE_integer("eval_episodes", 100, "Number of evaluation episodes.")
 flags.DEFINE_integer("evaluate_every", 50, "Number of episodes between evaluations.")
 
@@ -49,7 +49,11 @@ def build_network(num_hidden_units: int, num_actions: int) -> hk.Transformed:
 
     def pi(obs):
         flatten = lambda x: jnp.reshape(x, (-1,))
-        network = hk.Sequential([flatten, nets.MLP([num_hidden_units, num_actions])])
+        network = hk.Sequential([
+            flatten,
+            # nets.MLP([num_hidden_units, num_hidden_units]), jax.nn.relu,
+            nets.MLP([num_hidden_units, num_actions + 1])
+        ])
         return network(obs)
 
     return hk.without_apply_rng(hk.transform(pi))
@@ -58,41 +62,39 @@ def build_network(num_hidden_units: int, num_actions: int) -> hk.Transformed:
 class SequenceWithLogitsAccumulator:
     """Accumulator for gathering the latest timesteps into sequences including logit_t.
 
-  Note sequences can overlap and cross episode boundaries.
+    Note that accumulator ready when the episode is over.
   """
 
     def __init__(self, length):
         self._timesteps = collections.deque(maxlen=length)
 
-    def push(self, timestep, action, logit):
+    def push(self, timestep, action):
         # Replace `None`s with zeros as these will be put into NumPy arrays.
-        logit_tm1 = 0 if logit is None else logit
         a_tm1 = 0 if action is None else action
         timestep_t = timestep._replace(
             step_type=int(timestep.step_type),
             reward=0. if timestep.reward is None else timestep.reward,
             discount=0. if timestep.discount is None else timestep.discount,
         )
-        self._timesteps.append((logit_tm1, a_tm1, timestep_t))
+        self._timesteps.append((a_tm1, timestep_t))
 
     def sample(self, batch_size):
         """Returns current sequence of accumulated timesteps."""
         if batch_size != 1:
             raise ValueError("Require batch_size == 1.")
-        if len(self._timesteps) != self._timesteps.maxlen:
-            raise ValueError("Not enough timesteps for a full sequence.")
 
-        logits, actions, timesteps = jax.tree_map(lambda *ts: np.stack(ts), *self._timesteps)
-        return logits, actions, timesteps
+        actions, timesteps = jax.tree_map(lambda *ts: np.stack(ts), *self._timesteps)
+        self._timesteps.clear()
+        return actions, timesteps
 
     def is_ready(self, batch_size):
         if batch_size != 1:
             raise ValueError("Require batch_size == 1.")
-        return len(self._timesteps) == self._timesteps.maxlen
+        return self._timesteps[-1][-1].last()
 
 
-class OnlineQLambda:
-    """An online Q-lambda agent."""
+class EpisodicReinforce:
+    """An MC Reinforce algorithm."""
 
     def __init__(self, observation_spec, action_spec, num_hidden_units, epsilon, lambda_, learning_rate):
         self._observation_spec = observation_spec
@@ -119,11 +121,12 @@ class OnlineQLambda:
         return self._optimizer.init(params)
 
     def actor_step(self, params, env_output, actor_state, key, evaluation):
-        q = self._network.apply(params, env_output.observation)
-        train_a = rlax.epsilon_greedy(self._epsilon).sample(key, q)
-        eval_a = rlax.greedy().sample(key, q)
-        a = jax.lax.select(evaluation, eval_a, train_a)
-        return ActorOutput(actions=a, q_values=q), actor_state
+        output = self._network.apply(params, env_output.observation)
+        policy_logit = output[:-1]
+        value = output[-1]
+
+        a = hk.multinomial(key, policy_logit, num_samples=1)
+        return ActorOutput(actions=a, logits=policy_logit, q_values=value), actor_state
 
     def learner_step(self, params, data, learner_state, unused_key):
         dloss_dtheta = jax.grad(self._loss)(params, *data)
@@ -132,35 +135,39 @@ class OnlineQLambda:
         return params, learner_state
 
     def _loss(self, params, actions, timesteps):
-        """Calculates Q-lambda loss given parameters, actions and timesteps."""
+        """Calculates REINFORCE loss given parameters, actions and timesteps, and """
         network_apply_sequence = jax.vmap(self._network.apply, in_axes=(None, 0))
-        q = network_apply_sequence(params, timesteps.observation)
+        outputs = network_apply_sequence(params, timesteps.observation)
+        policy_logits = outputs[:, :-1]
+        values = outputs[:, -1]
 
         # Use a mask since the sequence could cross episode boundaries.
         mask = jnp.not_equal(timesteps.step_type, int(dm_env.StepType.LAST))
-        a_tm1 = actions[1:]
-        r_t = timesteps.reward[1:]
-        # Discount ought to be zero on a LAST timestep, use the mask to ensure this.
-        discount_t = timesteps.discount[1:] * mask[1:]
-        q_tm1 = q[:-1]
-        q_t = q[1:]
-        mask_tm1 = mask[:-1]
+
+        td_errors = rlax.td_lambda(
+            v_tm1=values[:-1],
+            r_t=timesteps.reward[1:],
+            discount_t=timesteps.discount[1:] * mask[1:],
+            v_t=values[1:],
+            lambda_=jnp.array(self._lambda),
+        )
+        critic_loss = jnp.mean(td_errors**2)
 
         # Mask out TD errors for the last state in an episode.
-        td_error_tm1 = mask_tm1 * rlax.q_lambda(q_tm1, a_tm1, r_t, discount_t, q_t, lambda_=self._lambda)
-        return jnp.sum(rlax.l2_loss(td_error_tm1)) / jnp.sum(mask_tm1)
+        policy_loss = rlax.policy_gradient_loss(policy_logits[:-1], actions[1:], adv_t=td_errors, w_t=jnp.ones((1,)))
+        return policy_loss + critic_loss
 
 
 def main(unused_arg):
     env = catch.Catch(seed=FLAGS.seed)
-    agent = OnlineQLambda(observation_spec=env.observation_spec(),
-                          action_spec=env.action_spec(),
-                          num_hidden_units=FLAGS.num_hidden_units,
-                          epsilon=FLAGS.epsilon,
-                          lambda_=FLAGS.lambda_,
-                          learning_rate=FLAGS.learning_rate)
+    agent = EpisodicReinforce(observation_spec=env.observation_spec(),
+                              action_spec=env.action_spec(),
+                              num_hidden_units=FLAGS.num_hidden_units,
+                              epsilon=FLAGS.epsilon,
+                              lambda_=FLAGS.lambda_,
+                              learning_rate=FLAGS.learning_rate)
 
-    accumulator = SequenceAccumulator(length=FLAGS.sequence_length)
+    accumulator = SequenceWithLogitsAccumulator(length=FLAGS.sequence_length)
     experiment.run_loop(
         agent=agent,
         environment=env,
