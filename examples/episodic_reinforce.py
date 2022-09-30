@@ -93,8 +93,8 @@ class SequenceWithLogitsAccumulator:
         return self._timesteps[-1][-1].last()
 
 
-class EpisodicReinforce:
-    """An MC Reinforce algorithm."""
+class EpisodicActorCritic:
+    """An Episodic Actor-Critic algorithm."""
 
     def __init__(self, observation_spec, action_spec, num_hidden_units, epsilon, lambda_, learning_rate):
         self._observation_spec = observation_spec
@@ -144,10 +144,13 @@ class EpisodicReinforce:
         # Use a mask since the sequence could cross episode boundaries.
         mask = jnp.not_equal(timesteps.step_type, int(dm_env.StepType.LAST))
 
+        # Discount ought to be zero on a LAST timestep, use the mask to ensure this.
+        discount_t = timesteps.discount[1:] * mask[1:]
+
         td_errors = rlax.td_lambda(
             v_tm1=values[:-1],
             r_t=timesteps.reward[1:],
-            discount_t=timesteps.discount[1:] * mask[1:],
+            discount_t=discount_t,
             v_t=values[1:],
             lambda_=jnp.array(self._lambda),
         )
