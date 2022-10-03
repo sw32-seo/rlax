@@ -1,19 +1,19 @@
 """An Episodic Actor-Critic agent trained to play BSuite's Catch env."""
 
 import collections
-from syslog import LOG_CRIT
-from absl import app
-from absl import flags
-from bsuite.environments import catch
+
 import dm_env
+import experiment
 import haiku as hk
-from haiku import nets
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from absl import app, flags
+from bsuite.environments import catch
+from haiku import nets
+
 import rlax
-import experiment
 
 ActorOutput = collections.namedtuple("ActorOutput", ["actions", "logits", "q_values"])
 
@@ -35,10 +35,7 @@ def build_network(num_hidden_units: int, num_actions: int) -> hk.Transformed:
 
     def pi(obs):
         flatten = lambda x: jnp.reshape(x, (-1,))
-        network = hk.Sequential([
-            flatten,
-            nets.MLP([num_hidden_units, num_actions + 1])
-        ])
+        network = hk.Sequential([flatten, nets.MLP([num_hidden_units, num_actions + 1])])
         return network(obs)
 
     return hk.without_apply_rng(hk.transform(pi))
@@ -91,9 +88,6 @@ class EpisodicActorCritic:
         self._network = build_network(num_hidden_units, action_spec.num_values)
 
         self._optimizer = optax.adam(learning_rate)
-        # Jitting for speed.
-        self.actor_step = jax.jit(self.actor_step)
-        self.learner_step = jax.jit(self.learner_step)
 
     def initial_params(self, key):
         sample_input = self._observation_spec.generate_value()
@@ -105,6 +99,8 @@ class EpisodicActorCritic:
     def initial_learner_state(self, params):
         return self._optimizer.init(params)
 
+    # jitting for speed
+    @jax.jit
     def actor_step(self, params, env_output, actor_state, key, evaluation):
         output = self._network.apply(params, env_output.observation)
         policy_logit = output[:-1]
@@ -113,6 +109,8 @@ class EpisodicActorCritic:
         a = hk.multinomial(key, policy_logit, num_samples=1)
         return ActorOutput(actions=a, logits=policy_logit, q_values=value), actor_state
 
+    # jitting for speed
+    @jax.jit
     def learner_step(self, params, data, learner_state, unused_key):
         dloss_dtheta = jax.grad(self._loss)(params, *data)
         updates, learner_state = self._optimizer.update(dloss_dtheta, learner_state)
@@ -148,12 +146,12 @@ class EpisodicActorCritic:
 
 def main(unused_arg):
     env = catch.Catch(seed=FLAGS.seed)
-    agent = EpisodicReinforce(observation_spec=env.observation_spec(),
-                              action_spec=env.action_spec(),
-                              num_hidden_units=FLAGS.num_hidden_units,
-                              epsilon=FLAGS.epsilon,
-                              lambda_=FLAGS.lambda_,
-                              learning_rate=FLAGS.learning_rate)
+    agent = EpisodicActorCritic(observation_spec=env.observation_spec(),
+                                action_spec=env.action_spec(),
+                                num_hidden_units=FLAGS.num_hidden_units,
+                                epsilon=FLAGS.epsilon,
+                                lambda_=FLAGS.lambda_,
+                                learning_rate=FLAGS.learning_rate)
 
     accumulator = SequenceWithLogitsAccumulator(length=FLAGS.sequence_length)
     experiment.run_loop(
